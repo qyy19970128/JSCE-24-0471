@@ -1,0 +1,712 @@
+function [x, dx, z, u, s, Ff, u_rbf_history] = run_simulation(x_d, dx_d, ddx_d, t, ...
+    lambda, eta_base, phi, rbf_gamma, rbf_width, ki, static_comp, ...
+    centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts)
+
+    % Initialize variables
+    N = length(t);
+    x = zeros(1, N);
+    dx = zeros(1, N);
+    z = zeros(1, N);
+    u = zeros(1, N);
+    s = zeros(1, N);
+    Ff = zeros(1, N);
+    u_rbf_history = zeros(1, N); 
+    integral_error = 0;
+    
+    % Simulation loop
+    for i = 1:(N-1)
+        % Calculate error and sliding surface
+        e = x_d(i) - x(i);
+        de = dx_d(i) - dx(i);
+        s(i) = de + lambda * e;
+        
+        % Update integral error
+        integral_error = integral_error + e * Ts;
+        integral_error = max(min(integral_error, 0.1), -0.1);  % Prevent integral saturation
+        
+        % Calculate LuGre friction force
+        if abs(dx(i)) < 1e-10
+            g_v = Fc + (Fs - Fc);  % Static case
+        else
+            g_v = Fc + (Fs - Fc) * exp(-(dx(i)/vs)^2);
+        end
+        
+        dz = dx(i) - (sigma0 * abs(dx(i)) * z(i)) / max(g_v, 1e-6);
+        z(i+1) = z(i) + dz * Ts;
+        Ff(i) = sigma0 * z(i) + sigma1 * dz + sigma2 * dx(i);
+        
+        % Calculate RBF network output
+        rbf_out = zeros(num_neurons, 1);
+        state = [e; de];
+        
+        for j = 1:num_neurons
+            dist = norm(state - centers(j,:)');
+            rbf_out(j) = exp(-dist^2 / (2 * rbf_width^2));
+        end
+        
+        u_rbf = rbf_gamma * sum(rbf_out);
+        u_rbf_history(i) = u_rbf; 
+        
+        % Calculate sliding mode control input
+        if abs(s(i)) > phi
+            u_sm = eta_base * sign(s(i));
+        else
+            u_sm = eta_base * s(i) / phi;
+        end
+        
+        % Integral control
+        u_integral = ki * integral_error;
+        
+        % Static compensation
+        static_compensation = static_comp * k * x_d(i);
+        
+        % Total control input
+        u(i) = u_sm + u_rbf + u_integral + static_compensation;
+        
+        % Apply to system
+        P = max(0, u(i) / A);  % Ensure pressure is non-negative
+        ddx = (P * A - b * dx(i) - k * x(i) - Ff(i)) / m;
+        
+        % Update states
+        dx(i+1) = dx(i) + ddx * Ts;
+        x(i+1) = x(i) + 0.5 * (dx(i) + dx(i+1)) * Ts;  
+    end
+    
+    % Fill in the last moment's friction force and RBFNN output
+    Ff(N) = Ff(N-1);
+    u_rbf_history(N) = u_rbf_history(N-1);
+end
+
+% New: RBFNN performance analysis function
+function analyze_rbf_performance(x, dx, x_d, dx_d, t, rbf_gamma, rbf_width, centers, Ff, u_rbf_history)
+    figure(10);
+    
+    % Plot 1: Friction force vs RBFNN estimation comparison
+    subplot(3,1,1);
+    plot(t, Ff, 'b-', 'LineWidth', 1.5); hold on;
+    plot(t, u_rbf_history, 'r--', 'LineWidth', 1.5);
+    legend('Actual Friction Force', 'RBFNN Estimation');
+    title('RBFNN Friction Force Estimation vs Actual Friction Force');
+    xlabel('Time (s)');
+    ylabel('Force (N)');
+    grid on;
+    
+    % Plot 2: Estimation error
+    subplot(3,1,2);
+    approx_error = Ff - u_rbf_history;
+    plot(t, approx_error, 'k-', 'LineWidth', 1.5);
+    title('RBFNN Estimation Error');
+    xlabel('Time (s)');
+    ylabel('Error (N)');
+    grid on;
+    
+    % Plot 3: RBFNN compensation ratio
+    subplot(3,1,3);
+    comp_ratio = zeros(size(t));
+    for i = 1:length(t)
+        if abs(Ff(i)) > 1e-6
+            comp_ratio(i) = abs(u_rbf_history(i))/abs(Ff(i))*100;
+        else
+            comp_ratio(i) = 0;
+        end
+    end
+    plot(t, comp_ratio, 'g-', 'LineWidth', 1.5);
+    title('RBFNN Compensation Ratio');
+    xlabel('Time (s)');
+    ylabel('Compensation Ratio (%)');
+    grid on;
+    ylim([0 150]);
+    
+    % Calculate performance metrics
+    mean_abs_error = mean(abs(approx_error));
+    rmse_approx = sqrt(mean(approx_error.^2));
+    max_error = max(abs(approx_error));
+    valid_indices = abs(Ff) > 1e-6;
+    if any(valid_indices)
+        mean_compensation_ratio = mean(abs(u_rbf_history(valid_indices))./abs(Ff(valid_indices))*100);
+    else
+        mean_compensation_ratio = 0;
+    end
+    
+    % Calculate correlation coefficient and coefficient of determination
+    correlation = corrcoef(Ff, u_rbf_history);
+    corr_coef = correlation(1,2);
+    SS_tot = sum((Ff - mean(Ff)).^2);
+    SS_res = sum((Ff - u_rbf_history).^2);
+    r_squared = 1 - SS_res/SS_tot;
+    
+    fprintf('\nRBFNN Friction Force Estimation Performance Metrics:\n');
+    fprintf('1. Mean Absolute Error: %.3f N\n', mean_abs_error);
+    fprintf('2. Root Mean Square Error (RMSE): %.3f N\n', rmse_approx);
+    fprintf('3. Maximum Error: %.3f N\n', max_error);
+    fprintf('4. Mean Compensation Ratio: %.2f%%\n', mean_compensation_ratio);
+    fprintf('5. Correlation Coefficient: %.4f\n', corr_coef);
+    fprintf('6. Coefficient of Determination (R²): %.4f\n', r_squared);
+end
+
+% RBFNN mapping visualization function
+function visualize_rbf_mapping(centers, rbf_width, rbf_gamma, num_neurons)
+    e_range = linspace(-0.02, 0.02, 100);
+    de_range = linspace(-0.1, 0.1, 100);
+    [E, DE] = meshgrid(e_range, de_range);
+    
+    % Initialize RBFNN output matrix
+    rbf_output = zeros(size(E));
+    
+    % Calculate RBFNN output for each grid point
+    for i = 1:size(E, 1)
+        for j = 1:size(E, 2)
+            state = [E(i,j); DE(i,j)];
+            rbf_out_sum = 0;
+            
+            for k = 1:num_neurons
+                dist = norm(state - centers(k,:)');
+                rbf_out_sum = rbf_out_sum + exp(-dist^2 / (2 * rbf_width^2));
+            end
+            
+            rbf_output(i,j) = rbf_gamma * rbf_out_sum;
+        end
+    end
+    
+    % Plot RBFNN mapping surface
+    figure(11);
+    surf(E, DE, rbf_output);
+    title('RBFNN Nonlinear Mapping Surface');
+    xlabel('Position Error (m)');
+    ylabel('Velocity Error (m/s)');
+    zlabel('Compensation Force (N)');
+    colorbar;
+    grid on;
+    
+    % Plot contour map
+    figure(12);
+    contourf(E, DE, rbf_output, 20);
+    title('RBFNN Nonlinear Mapping Contour');
+    xlabel('Position Error (m)');
+    ylabel('Velocity Error (m/s)');
+    colorbar;
+    grid on;
+    
+    % Output RBFNN parameter information
+    fprintf('\nRBFNN Mapping Parameters:\n');
+    fprintf('1. Number of Neurons: %d\n', num_neurons);
+    fprintf('2. RBF Width Parameter: %.4f\n', rbf_width);
+    fprintf('3. RBF Output Weight: %.4f\n', rbf_gamma);
+    fprintf('4. Center Point Distribution Range: Position Error [%.4f, %.4f] m, Velocity Error [%.4f, %.4f] m/s\n', ...
+        min(centers(:,1)), max(centers(:,1)), min(centers(:,2)), max(centers(:,2)));
+    
+    % Analyze density in different regions
+    small_e_region = abs(centers(:,1)) < 0.002;
+    small_de_region = abs(centers(:,2)) < 0.01;
+    small_region_density = sum(small_e_region & small_de_region) / num_neurons * 100;
+    
+    fprintf('5. Small Error Region Center Point Density (|e|<0.002, |de|<0.01): %.1f%%\n', small_region_density);
+end
+
+% New: Function to compare with and without RBFNN
+function compare_with_without_rbfnn(x_d, dx_d, ddx_d, t, params, centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts)
+    % Run simulation with RBFNN
+    [x_with, dx_with, z_with, u_with, s_with, Ff_with, u_rbf_history] = run_simulation(x_d, dx_d, ddx_d, t, ...
+        params(1), params(2), params(3), params(4), params(5), params(6), params(7), ...
+        centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+    
+    % Run simulation without RBFNN (set rbf_gamma to 0)
+    [x_without, dx_without, z_without, u_without, s_without, Ff_without, u_rbf_without] = run_simulation(x_d, dx_d, ddx_d, t, ...
+        params(1), params(2), params(3), 0, params(5), params(6), params(7), ...
+        centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+    
+    % Plot results
+    figure(14);
+    subplot(2,1,1);
+    plot(t, x_d*1000, 'r--', 'LineWidth', 1.5); hold on;
+    plot(t, x_with*1000, 'b-', 'LineWidth', 1.5);
+    plot(t, x_without*1000, 'g-', 'LineWidth', 1.5);
+    grid on;
+    legend('Target Position', 'With RBFNN', 'Without RBFNN');
+    title('Position Tracking Comparison');
+    xlabel('Time (s)');
+    ylabel('Position (mm)');
+    
+    subplot(2,1,2);
+    plot(t, (x_d - x_with)*1000, 'b-', 'LineWidth', 1.5); hold on;
+    plot(t, (x_d - x_without)*1000, 'g-', 'LineWidth', 1.5);
+    grid on;
+    legend('Error With RBFNN', 'Error Without RBFNN');
+    title('Position Error Comparison');
+    xlabel('Time (s)');
+    ylabel('Error (mm)');
+    
+    % Calculate performance metrics
+    rmse_with = sqrt(mean((x_d - x_with).^2)) * 1000; 
+    rmse_without = sqrt(mean((x_d - x_without).^2)) * 1000;
+    
+    steady_error_with = abs(mean(x_d(end-100:end) - x_with(end-100:end))) * 1000;
+    steady_error_without = abs(mean(x_d(end-100:end) - x_without(end-100:end))) * 1000;
+    
+    % Calculate friction force compensation ratio
+    compensation_ratio = mean(abs(u_rbf_history)./max(abs(Ff_with), 1e-6))*100;
+    
+    % Output comparison results
+    fprintf('\nPerformance Comparison With vs Without RBFNN:\n');
+    fprintf('1. RMSE With RBFNN: %.5f mm\n', rmse_with);
+    fprintf('2. RMSE Without RBFNN: %.5f mm\n', rmse_without);
+    fprintf('3. RMSE Improvement: %.2f%%\n', (rmse_without - rmse_with)/rmse_without*100);
+    fprintf('4. Steady-State Error With RBFNN: %.5f mm\n', steady_error_with);
+    fprintf('5. Steady-State Error Without RBFNN: %.5f mm\n', steady_error_without);
+    fprintf('6. Steady-State Error Improvement: %.2f%%\n', (steady_error_without - steady_error_with)/steady_error_without*100);
+    fprintf('7. RBFNN Average Friction Force Compensation Ratio: %.2f%%\n', compensation_ratio);
+    
+    % Compare friction force compensation
+    figure(15);
+    subplot(2,1,1);
+    plot(t, Ff_with, 'b-', 'LineWidth', 1.5); hold on;
+    plot(t, u_rbf_history, 'r--', 'LineWidth', 1.5);
+    grid on;
+    legend('Actual Friction Force', 'RBFNN Compensation Force');
+    title('Friction Force vs RBFNN Compensation Force Comparison');
+    xlabel('Time (s)');
+    ylabel('Force (N)');
+    
+    subplot(2,1,2);
+    plot(t, abs(Ff_with - u_rbf_history), 'k-', 'LineWidth', 1.5);
+    grid on;
+    title('Friction Force Compensation Error');
+    xlabel('Time (s)');
+    ylabel('Error (N)');
+end
+
+% System parameter identification and analysis
+function identify_system_params(m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs)
+    fprintf('\nSystem Parameter Analysis:\n');
+    fprintf('1. Mechanical Time Constant: %.3f s\n', m/b);
+    fprintf('2. Natural Frequency: %.3f Hz\n', sqrt(k/m)/2/pi);
+    fprintf('3. Damping Ratio: %.3f\n', b/(2*sqrt(k*m)));
+    fprintf('4. Static Gain: %.5f mm/N\n', 1000/(k));
+    fprintf('5. Maximum Static Friction Force: %.2f N\n', Fs);
+    fprintf('6. Maximum Force Available: %.2f N\n', A * 5e5);  % Assuming maximum pressure of 5bar
+    
+    % Analyze system dynamic characteristics
+    natural_freq = sqrt(k/m);  % Natural frequency
+    damping_ratio = b/(2*sqrt(k*m));  % Damping ratio
+    
+    if damping_ratio < 1
+        fprintf('System is underdamped, overshoot phenomena expected\n');
+        overshoot = exp(-pi*damping_ratio/sqrt(1-damping_ratio^2)) * 100;
+        fprintf('Theoretical overshoot: %.2f%%\n', overshoot);
+    elseif damping_ratio == 1
+        fprintf('System is critically damped, response will have no overshoot\n');
+    else
+        fprintf('System is overdamped, response will be slow with no overshoot\n');
+    end
+    
+    % Analyze nonlinear factors
+    fprintf('\nNonlinear Factor Analysis:\n');
+    fprintf('1. Friction Force to Spring Force Ratio: %.2f%%\n', Fs/k*0.01*100);
+    fprintf('2. LuGre Model Stiffness to System Stiffness Ratio: %.2f%%\n', sigma0/k*100);
+    
+    % Control design recommendations
+    fprintf('\nControl Design Recommendations:\n');
+    if Fs > k*0.005
+        fprintf('- Due to significant friction force influence, friction compensation is recommended\n');
+    end
+    
+    if damping_ratio < 0.5
+        fprintf('- Due to low damping ratio, increasing derivative control gain is recommended\n');
+    end
+    
+    if A*5e5 < 1.5*k*0.01
+        fprintf('- Warning: Pneumatic force may not be sufficient to overcome spring force, consider increasing air pressure\n');
+    end
+end
+
+% Parameter sensitivity analysis
+function analyze_parameter_sensitivity(x_d, dx_d, ddx_d, t, best_params, centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts)
+    % Best parameters
+    lambda_best = best_params(1);
+    eta_base_best = best_params(2);
+    phi_best = best_params(3);
+    rbf_gamma_best = best_params(4);
+    rbf_width_best = best_params(5);
+    ki_best = best_params(6);
+    static_comp_best = best_params(7);
+    
+    % Parameter variation range
+    variation = 0.2;  
+    
+    % Initialize results array
+    params = {'lambda', 'eta_base', 'phi', 'rbf_gamma', 'rbf_width', 'ki', 'static_comp'};
+    rmse_results = zeros(length(params), 3);  % -20%, 0%, +20%
+    
+    % Baseline performance
+    [x_base, ~, ~, ~, ~, ~, ~] = run_simulation(x_d, dx_d, ddx_d, t, ...
+        lambda_best, eta_base_best, phi_best, rbf_gamma_best, rbf_width_best, ki_best, static_comp_best, ...
+        centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+    rmse_base = sqrt(mean((x_d - x_base).^2)) * 1000;
+    
+    % Analyze each parameter's impact
+    for i = 1:length(params)
+        % Parameter decreased by 20%
+        param_values = [lambda_best, eta_base_best, phi_best, rbf_gamma_best, rbf_width_best, ki_best, static_comp_best];
+        param_values(i) = param_values(i) * (1 - variation);
+        
+        [x_minus, ~, ~, ~, ~, ~, ~] = run_simulation(x_d, dx_d, ddx_d, t, ...
+            param_values(1), param_values(2), param_values(3), param_values(4), ...
+            param_values(5), param_values(6), param_values(7), ...
+            centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+        rmse_results(i, 1) = sqrt(mean((x_d - x_minus).^2)) * 1000;
+        
+        % Baseline parameter
+        rmse_results(i, 2) = rmse_base;
+        
+        % Parameter increased by 20%
+        param_values = [lambda_best, eta_base_best, phi_best, rbf_gamma_best, rbf_width_best, ki_best, static_comp_best];
+        param_values(i) = param_values(i) * (1 + variation);
+        
+        [x_plus, ~, ~, ~, ~, ~, ~] = run_simulation(x_d, dx_d, ddx_d, t, ...
+            param_values(1), param_values(2), param_values(3), param_values(4), ...
+            param_values(5), param_values(6), param_values(7), ...
+            centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+        rmse_results(i, 3) = sqrt(mean((x_d - x_plus).^2)) * 1000;
+    end
+    
+    % Calculate sensitivity
+    sensitivity = zeros(length(params), 1);
+    for i = 1:length(params)
+        sensitivity(i) = abs(rmse_results(i, 3) - rmse_results(i, 1)) / (2 * variation * rmse_base);
+    end
+    
+    % Sensitivity analysis results
+    fprintf('\nParameter Sensitivity Analysis:\n');
+    fprintf('%-12s | %-10s | %-10s | %-10s | %-10s\n', 'Parameter', '-20%', 'Baseline', '+20%', 'Sensitivity');
+    fprintf('---------------------------------------------------------------\n');
+    for i = 1:length(params)
+        fprintf('%-12s | %-10.3f | %-10.3f | %-10.3f | %-10.3f\n', ...
+            params{i}, rmse_results(i, 1), rmse_results(i, 2), rmse_results(i, 3), sensitivity(i));
+    end
+    
+    % Plot sensitivity analysis graph
+    figure(7);
+    bar(sensitivity);
+    set(gca, 'XTickLabel', params);
+    title('Parameter Sensitivity Analysis');
+    xlabel('Parameter');
+    ylabel('Sensitivity Index');
+    grid on;
+    
+    % Focus on RLRBFNN parameter sensitivity
+    fprintf('\nRLRBFNN Parameter Sensitivity Analysis:\n');
+    fprintf('1. rbf_gamma sensitivity: %.3f\n', sensitivity(4));
+    fprintf('2. rbf_width sensitivity: %.3f\n', sensitivity(5));
+    if sensitivity(4) > 1.0 || sensitivity(5) > 1.0
+        fprintf('Note: RBFNN parameter sensitivity is high, careful adjustment needed\n');
+    else
+        fprintf('RLRBFNN parameter sensitivity is moderate, controller has good robustness\n');
+    end
+end
+
+% Disturbance response analysis function
+function analyze_disturbance_response(x_d, dx_d, ddx_d, t, best_params, centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts)
+    % Best parameters
+    lambda_best = best_params(1);
+    eta_base_best = best_params(2);
+    phi_best = best_params(3);
+    rbf_gamma_best = best_params(4);
+    rbf_width_best = best_params(5);
+    ki_best = best_params(6);
+    static_comp_best = best_params(7);
+    
+    % Initialize variables
+    N = length(t);
+    x = zeros(1, N);
+    dx = zeros(1, N);
+    z = zeros(1, N);
+    u = zeros(1, N);
+    s = zeros(1, N);
+    Ff = zeros(1, N);
+    u_rbf = zeros(1, N);  % Add RBFNN output recording
+    integral_error = 0;
+    
+    % Add external disturbance - apply pulse disturbance at specific time point
+    disturbance = zeros(1, N);
+    disturb_time = 3;  % Disturbance time point (s)
+    disturb_index = find(t >= disturb_time, 1);
+    disturb_duration = 0.1;  % Disturbance duration (s)
+    disturb_end_index = find(t >= disturb_time + disturb_duration, 1);
+    disturbance(disturb_index:disturb_end_index) = 50;  % 50N disturbance force
+    
+    % Simulation loop
+    for i = 1:N-1
+        % Calculate error and sliding surface
+        e = x_d(i) - x(i);
+        de = dx_d(i) - dx(i);
+        s(i) = de + lambda_best * e;
+        
+        % Update integral error
+        integral_error = integral_error + e * Ts;
+        integral_error = max(min(integral_error, 0.1), -0.1);
+        
+        % Calculate LuGre friction force
+        if abs(dx(i)) < 1e-10
+            g_v = Fc + (Fs - Fc);
+        else
+            g_v = Fc + (Fs - Fc) * exp(-(dx(i)/vs)^2);
+        end
+        
+        dz = dx(i) - (sigma0 * abs(dx(i)) * z(i)) / max(g_v, 1e-6);
+        z(i+1) = z(i) + dz * Ts;
+        Ff(i) = sigma0 * z(i) + sigma1 * dz + sigma2 * dx(i);
+        
+        % Calculate RBF network output
+        rbf_out = zeros(num_neurons, 1);
+        state = [e; de];
+        
+        for j = 1:num_neurons
+            dist = norm(state - centers(j,:)');
+            rbf_out(j) = exp(-dist^2 / (2 * rbf_width_best^2));
+        end
+        
+        u_rbf(i) = rbf_gamma_best * sum(rbf_out);
+        
+        % Calculate sliding mode control input
+        if abs(s(i)) > phi_best
+            u_sm = eta_base_best * sign(s(i));
+        else
+            u_sm = eta_base_best * s(i) / phi_best;
+        end
+        
+        % Integral control
+        u_integral = ki_best * integral_error;
+        
+        % Static compensation
+        static_compensation = static_comp_best * k * x_d(i);
+        
+        % Total control input
+        u(i) = u_sm + u_rbf(i) + u_integral + static_compensation;
+        
+        % Apply to system (add disturbance)
+        P = max(0, u(i) / A);
+        ddx = (P * A - b * dx(i) - k * x(i) - Ff(i) - disturbance(i)) / m;
+        
+        % Update states
+        dx(i+1) = dx(i) + ddx * Ts;
+        x(i+1) = x(i) + 0.5 * (dx(i) + dx(i+1)) * Ts;
+    end
+    
+    % Fill in the last moment
+    Ff(N) = Ff(N-1);
+    s(N) = s(N-1);
+    u(N) = u(N-1);
+    u_rbf(N) = u_rbf(N-1);
+    
+    % Plot results
+    figure(8);
+    subplot(5,1,1);
+    plot(t, x_d*1000, 'r--', 'LineWidth', 1.5); hold on;
+    plot(t, x*1000, 'b-', 'LineWidth', 1);
+    grid on;
+    legend('Target Position', 'Actual Position');
+    title('Disturbance Response Test');
+    xlabel('Time (s)');
+    ylabel('Position (mm)');
+    
+    subplot(5,1,2);
+    plot(t, (x_d - x)*1000, 'b-', 'LineWidth', 1);
+    grid on;
+    title('Position Error');
+    xlabel('Time (s)');
+    ylabel('Error (mm)');
+    
+    subplot(5,1,3);
+    plot(t, u, 'g-', 'LineWidth', 1);
+    grid on;
+    title('Total Control Input');
+    xlabel('Time (s)');
+    ylabel('Control Force (N)');
+    
+    subplot(5,1,4);
+    plot(t, u_rbf, 'r-', 'LineWidth', 1.5);
+    grid on;
+    title('RBFNN Compensation Output');
+    xlabel('Time (s)');
+    ylabel('Compensation Force (N)');
+    
+    subplot(5,1,5);
+    plot(t, disturbance, 'm-', 'LineWidth', 1.5);
+    grid on;
+    title('External Disturbance');
+    xlabel('Time (s)');
+    ylabel('Disturbance Force (N)');
+    
+    % Calculate disturbance rejection capability metrics
+    disturb_start = disturb_index;
+    recovery_time_index = find(abs(x_d(disturb_end_index:end) - x(disturb_end_index:end)) < 0.0001, 1) + disturb_end_index - 1;
+    
+    if ~isempty(recovery_time_index)
+        recovery_time = t(recovery_time_index) - t(disturb_end_index);
+        max_error_during_disturb = max(abs(x_d(disturb_index:disturb_end_index) - x(disturb_index:disturb_end_index))) * 1000;
+        
+        rbf_contrib_during_disturb = mean(abs(u_rbf(disturb_index:disturb_end_index))) / mean(abs(u(disturb_index:disturb_end_index))) * 100;
+        
+        fprintf('\nDisturbance Response Analysis:\n');
+        fprintf('1. Disturbance application time: %.2f s\n', t(disturb_index));
+        fprintf('2. Maximum disturbance force: %.2f N\n', max(disturbance));
+        fprintf('3. Maximum position error during disturbance: %.3f mm\n', max_error_during_disturb);
+        fprintf('4. Recovery time: %.3f s\n', recovery_time);
+        fprintf('5. RLRBFNN contribution during disturbance: %.2f%%\n', rbf_contrib_during_disturb);
+    else
+        fprintf('\nDisturbance Response Analysis:\n');
+        fprintf('System did not fully recover within the simulation time\n');
+    end
+end
+
+% Function to compare with traditional adaptive sliding mode control
+function run_adaptive_SMC_test(x_d, dx_d, ddx_d, t, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts)
+    % Initialize variables
+    N = length(t);
+    x_asmc = zeros(1, N);
+    dx_asmc = zeros(1, N);
+    z_asmc = zeros(1, N);
+    u_asmc = zeros(1, N);
+    s_asmc = zeros(1, N);
+    Ff_asmc = zeros(1, N);
+    
+    % Adaptive SMC parameters
+    lambda_asmc = 30;
+    eta_base_asmc = 40;
+    phi_asmc = 0.1;
+    gamma_adapt = 50;  % Adaptive gain
+    k_adapt = 0.1;     % Adaptive coefficient
+    w_adapt = zeros(1, N);  % Adaptive weight
+    
+    % Integral control and static compensation parameters
+    ki_asmc = 5.3;
+    static_comp_asmc = 0.95;
+    integral_error = 0;
+    
+    % Simulation loop
+    for i = 1:N-1
+        % Calculate error and sliding surface
+        e = x_d(i) - x_asmc(i);
+        de = dx_d(i) - dx_asmc(i);
+        s_asmc(i) = de + lambda_asmc * e;
+        
+        % Update integral error
+        integral_error = integral_error + e * Ts;
+        integral_error = max(min(integral_error, 0.1), -0.1);
+        
+        % Calculate LuGre friction force
+        if abs(dx_asmc(i)) < 1e-10
+            g_v = Fc + (Fs - Fc);
+        else
+            g_v = Fc + (Fs - Fc) * exp(-(dx_asmc(i)/vs)^2);
+        end
+        
+        dz = dx_asmc(i) - (sigma0 * abs(dx_asmc(i)) * z_asmc(i)) / max(g_v, 1e-6);
+        z_asmc(i+1) = z_asmc(i) + dz * Ts;
+        Ff_asmc(i) = sigma0 * z_asmc(i) + sigma1 * dz + sigma2 * dx_asmc(i);
+        
+        % Calculate adaptive weight
+        dw = gamma_adapt * abs(s_asmc(i)) - k_adapt * w_adapt(i);
+        w_adapt(i+1) = w_adapt(i) + dw * Ts;
+        w_adapt(i+1) = max(0, w_adapt(i+1));  % Ensure weight is non-negative
+        
+        % Calculate adaptive SMC input
+        if abs(s_asmc(i)) > phi_asmc
+            u_sm = (eta_base_asmc + w_adapt(i)) * sign(s_asmc(i));
+        else
+            u_sm = (eta_base_asmc + w_adapt(i)) * s_asmc(i) / phi_asmc;
+        end
+        
+        % Integral control
+        u_integral = ki_asmc * integral_error;
+        
+        % Static compensation
+        static_compensation = static_comp_asmc * k * x_d(i);
+        
+        % Total control input
+        u_asmc(i) = u_sm + u_integral + static_compensation;
+        
+        % Apply to system
+        P = max(0, u_asmc(i) / A);
+        ddx = (P * A - b * dx_asmc(i) - k * x_asmc(i) - Ff_asmc(i)) / m;
+        
+        % Update states
+        dx_asmc(i+1) = dx_asmc(i) + ddx * Ts;
+        x_asmc(i+1) = x_asmc(i) + 0.5 * (dx_asmc(i) + dx_asmc(i+1)) * Ts;
+    end
+    
+    % Fill in the last moment
+    Ff_asmc(N) = Ff_asmc(N-1);
+    s_asmc(N) = s_asmc(N-1);
+    u_asmc(N) = u_asmc(N-1);
+    
+    % Run comparative simulation using optimal RBF-SMC parameters
+    [x_rbf, dx_rbf, z_rbf, u_rbf, s_rbf, Ff_rbf, u_rbfnn] = run_simulation(x_d, dx_d, ddx_d, t, ...
+        30.5, 41.5, 0.115, 1.2, 1.05, 5.3, 0.95, ...
+        repmat(centers, 1, 1), size(centers, 1), m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+    
+    % Plot comparison results
+    figure(9);
+    subplot(3,1,1);
+    plot(t, x_d*1000, 'r--', 'LineWidth', 1.5); hold on;
+    plot(t, x_rbf*1000, 'b-', 'LineWidth', 1.5);
+    plot(t, x_asmc*1000, 'g-', 'LineWidth', 1.5);
+    grid on;
+    legend('Target Position', 'RBF-SMC', 'Adaptive SMC');
+    title('RL-SMC vs Adaptive SMC Position Tracking Comparison');
+    xlabel('Time (s)');
+    ylabel('Position (mm)');
+    
+    subplot(3,1,2);
+    plot(t, (x_d - x_rbf)*1000, 'b-', 'LineWidth', 1.5); hold on;
+    plot(t, (x_d - x_asmc)*1000, 'g-', 'LineWidth', 1.5);
+    grid on;
+    legend('RL-SMC Error', 'Adaptive SMC Error');
+    title('Position Error Comparison');
+    xlabel('Time (s)');
+    ylabel('Error (mm)');
+    
+    subplot(3,1,3);
+    plot(t, u_rbf, 'b-', 'LineWidth', 1.5); hold on;
+    plot(t, u_asmc, 'g-', 'LineWidth', 1.5);
+    grid on;
+    legend('RL-SMC Control', 'Adaptive SMC Control');
+    title('Control Input Comparison');
+    xlabel('Time (s)');
+    ylabel('Control Force (N)');
+    
+    % Calculate performance metrics
+    rmse_rbf = sqrt(mean((x_d - x_rbf).^2)) * 1000;
+    rmse_asmc = sqrt(mean((x_d - x_asmc).^2)) * 1000;
+    
+    steady_error_rbf = abs(mean(x_d(end-100:end) - x_rbf(end-100:end))) * 1000;
+    steady_error_asmc = abs(mean(x_d(end-100:end) - x_asmc(end-100:end))) * 1000;
+    
+    % Calculate control smoothness
+    control_smoothness_rbf = std(diff(u_rbf));
+    control_smoothness_asmc = std(diff(u_asmc));
+    
+    fprintf('\nRL-SMC vs Adaptive SMC Performance Comparison:\n');
+    fprintf('1. RL-SMC RMSE: %.5f mm\n', rmse_rbf);
+    fprintf('2. Adaptive SMC RMSE: %.5f mm\n', rmse_asmc);
+    fprintf('3. RMSE Comparison: RBF-SMC better than Adaptive SMC by %.2f%%\n', (rmse_asmc - rmse_rbf)/rmse_asmc*100);
+    fprintf('4. RL-SMC Steady-State Error: %.5f mm\n', steady_error_rbf);
+    fprintf('5. Adaptive SMC Steady-State Error: %.5f mm\n', steady_error_asmc);
+    fprintf('6. Steady-State Error Comparison: RBF-SMC better than Adaptive SMC by %.2f%%\n', (steady_error_asmc - steady_error_rbf)/steady_error_asmc*100);
+    fprintf('7. RL-SMC Control Smoothness: %.2f\n', control_smoothness_rbf);
+    fprintf('8. Adaptive SMC Control Smoothness: %.2f\n', control_smoothness_asmc);
+    fprintf('9. Control Smoothness Comparison: RL-SMC better than Adaptive SMC by %.2f%%\n', (control_smoothness_asmc - control_smoothness_rbf)/control_smoothness_asmc*100);
+    
+    if rmse_rbf < rmse_asmc && steady_error_rbf < steady_error_asmc
+        fprintf('\nConclusion: RL Neural Network Sliding Mode Control is superior to traditional Adaptive Sliding Mode Control in both RMSE and steady-state error\n');
+        if control_smoothness_rbf < control_smoothness_asmc
+            fprintf('RBF-SMC also exhibits smoother control output, which helps extend actuator life\n');
+        end
+    elseif rmse_rbf < rmse_asmc
+        fprintf('\nConclusion: RL Neural Network Sliding Mode Control is superior to traditional Adaptive Sliding Mode Control in RMSE, but has larger steady-state error\n');
+    elseif steady_error_rbf < steady_error_asmc
+        fprintf('\nConclusion: RL Neural Network Sliding Mode Control is superior to traditional Adaptive Sliding Mode Control in steady-state error, but has larger RMSE\n');
+    else
+        fprintf('\nConclusion: Traditional Adaptive Sliding Mode Control performs better with the current parameter settings\n');
+    end
+end
