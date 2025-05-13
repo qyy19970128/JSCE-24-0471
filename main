@@ -1,0 +1,594 @@
+clear all;
+close all;
+clc;
+% Pneumatic control valve parameters
+
+
+% LuGre friction model parameters
+
+
+Ts = 0.001;  
+T_final = 5;   
+t = 0:Ts:T_final;
+N = length(t);
+
+% Reference trajectory
+x_d = 0.01 * ones(size(t)); 
+x_d(t < 0) = 0;
+dx_d = zeros(size(t));     
+ddx_d = zeros(size(t));     
+
+% Basic parameters of RBF neural network
+num_neurons = 100;  
+rbf_width_init = 1.5; 
+
+e_small_range = linspace(-0.0015, 0.0015, 5);  
+e_large_range = [-0.015, -0.005, 0.005, 0.015]; 
+e_range = sort([e_small_range, e_large_range]);
+
+de_small_range = linspace(-0.008, 0.008, 5);  
+de_large_range = [-0.08, -0.03, 0.03, 0.08]; 
+de_range = sort([de_small_range, de_large_range]);
+
+[E, DE] = meshgrid(e_range, de_range);
+centers = [E(:), DE(:)];  % Center Point Matrix
+
+%% Reinforcement Learning Parameters 
+
+actor_learning_rate = 0.05;   
+critic_learning_rate = 0.003;  
+gamma = 0.995;                 
+tau = 0.001;                  
+batch_size = 128;             
+buffer_size = 100000;         
+exploration_noise = 0.15;      
+max_episodes = 500;            
+max_steps_per_episode = 500;  
+
+% Parameter range adjustment
+param_ranges = [
+    0, 31;       
+    40, 42;      
+    0.1, 0.15;  
+   0.01, 1.5;    
+    0.1, 1.1;   
+   0.1, 5.5;     
+    0.1, 1.2;   
+];
+
+
+action_dim = size(param_ranges, 1);
+% State space dimensions (position error, velocity error, sliding surface value, integral error, RBF output)
+state_dim = 5;
+
+% Initialize the network
+actor = init_network(state_dim, 64, action_dim);
+critic = init_network(state_dim + action_dim, 64, 1);
+target_actor = actor;
+target_critic = critic;
+
+replay_buffer = [];
+
+%% Training loop
+best_reward = -inf;
+best_params = zeros(action_dim, 1);
+episode_rewards = zeros(max_episodes, 1);
+% Add parameter history variable
+param_history = zeros(max_episodes, action_dim);
+param_names = {'lambda', 'eta_base', 'phi', 'rbf_gamma', 'rbf_width', 'ki', 'static_comp'};
+% Add variables to track steady-state error
+best_steady_state_error = inf;
+best_steady_state_params = zeros(action_dim, 1);
+steady_state_errors = zeros(max_episodes, 1);
+steady_error_target = 0.0001;  % The target steady-state error is 0.001mm
+target_reached = false;  % 0.0001mm threshold marker
+target_reached_0_2 = false;  % 0.0002mm threshold marker
+target_reached_0_5 = false;  % 0.0005mm threshold marker
+final_params = [];  % Store parameters reaching 0.0001mm error
+final_params_0_2 = [];  % Store parameters reaching 0.0002mm error
+final_params_0_5 = [];  % Store parameters reaching 0.0005mm error
+
+% Check static force requirements
+static_force_needed = k * x_d(end);
+max_force_available = Ps * A;
+
+fprintf('System diagnostic information:\n');
+fprintf('Target location: %.3f mm\n', x_d(end)*1000);
+fprintf('Required static force: %.2f N\n', static_force_needed);
+fprintf('Maximum available force: %.2f N\n', max_force_available);
+
+if max_force_available < static_force_needed
+    fprintf('Warning: Air pressure may not be sufficient to overcome spring force!\n');
+else
+    fprintf('Air pressure is sufficient, target position can be reached\n');
+end
+early_stop_threshold = 0.00012;  % Early termination threshold, slightly higher than target
+early_stop_count = 0;           % Number of consecutive times threshold is met
+early_stop_required = 5;        % Required number of consecutive times
+
+early_terminated = false;
+final_simulation_params = [];
+
+% Add variables to record RBF output and friction force estimation error
+rbf_errors = zeros(max_episodes, 1);
+friction_approximation_ratios = zeros(max_episodes, 1);
+
+for episode = 1:max_episodes
+    % Reset environment
+    x_init = 0;
+    dx_init = 0;
+    z_init = 0;
+    
+    % Initial state
+    e = x_d(1) - x_init;
+    de = dx_d(1) - dx_init;
+    s = de + 15 * e;  % Use initial lambda value
+    integral_error = 0;
+    rbf_out_sum = 0;
+    
+    state = [e; de; s; integral_error; rbf_out_sum];
+    
+    
+    % Get initial action (control parameters)
+ 
+    current_noise = exploration_noise * (1 - episode / max_episodes);
+    action = get_action(actor, state, current_noise, param_ranges);
+    param_history(episode, :) = action;
+    lambda = action(1);
+    eta_base = action(2);
+    phi = action(3);
+    rbf_gamma = action(4);
+    rbf_width = action(5);
+    ki = action(6);
+    static_comp = action(7);
+    
+   total_reward = 0;
+    x_history = zeros(1, max_steps_per_episode);
+    
+    for step = 1:max_steps_per_episode
+        % Current time
+        current_index = min(step, N);
+        
+        % Current reference input
+        current_x_d = x_d(current_index);
+        current_dx_d = dx_d(current_index);
+        current_ddx_d = ddx_d(current_index);
+        
+        % Run simulation one step using current parameters
+        [next_x, next_dx, next_z, next_e, next_de, next_s, next_integral_error, next_rbf_out_sum, reward, u, u_rbf, Ff_current] = ...
+            simulate_step(x_init, dx_init, z_init, current_x_d, current_dx_d, current_ddx_d, ...
+                          lambda, eta_base, phi, rbf_gamma, rbf_width, ki, static_comp, centers, Ts, ...
+                          m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs);
+        
+        % Record friction force and RBF network output
+        friction_history(step) = Ff_current;
+        rbf_output_history(step) = u_rbf;
+        
+        % Update state
+        next_state = [next_e; next_de; next_s; next_integral_error; next_rbf_out_sum];
+        
+        % Check for NaN and Inf and replace
+        if any(isnan(next_state)) || any(isinf(next_state))
+            next_state(isnan(next_state) | isinf(next_state)) = 0;
+            reward = -2000;  % Severely penalize invalid states
+        end
+        
+        % Record position
+        x_history(step) = next_x;
+        
+        % Store experience
+        experience.state = state;
+        experience.action = action;
+        experience.reward = reward;
+        experience.next_state = next_state;
+        experience.done = (step == max_steps_per_episode);
+        experience.priority = 1.0;  % Initial priority
+        
+        replay_buffer = [replay_buffer; experience];
+        if length(replay_buffer) > buffer_size
+            replay_buffer = replay_buffer(2:end);
+        end
+        
+        % Sample from experience replay for learning
+        if length(replay_buffer) >= batch_size
+            % Use priority sampling to get batch
+            batch = sample_prioritized_batch(replay_buffer, batch_size);
+            
+            % Update networks
+            [replay_buffer, actor, critic, target_actor, target_critic] = update_networks_with_priority(batch, replay_buffer, actor, critic, ...
+                          target_actor, target_critic, actor_learning_rate, critic_learning_rate, ...
+                          gamma, tau, param_ranges, state_dim, action_dim);
+        end
+        
+        % Update state
+        state = next_state;
+        x_init = next_x;
+        dx_init = next_dx;
+        z_init = next_z;
+        
+        % Accumulate reward
+        total_reward = total_reward + reward;
+        
+        % Get next action
+        action = get_action(actor, state, current_noise, param_ranges);
+        
+        % Decode parameters
+        lambda = action(1);
+        eta_base = action(2);
+        phi = action(3);
+        rbf_gamma = action(4);
+        rbf_width = action(5);
+        ki = action(6);
+        static_comp = action(7);
+    end
+    
+    % Calculate RBFNN friction force estimation error
+    rbf_approx_error = mean(abs(friction_history - rbf_output_history));
+    rbf_errors(episode) = rbf_approx_error;
+    
+    % Calculate RBFNN compensation ratio
+    valid_indices = abs(friction_history) > 1e-6;
+    if any(valid_indices)
+        friction_approximation_ratio = mean(abs(rbf_output_history(valid_indices))./abs(friction_history(valid_indices)))*100;
+        friction_approximation_ratios(episode) = friction_approximation_ratio;
+    else
+        friction_approximation_ratios(episode) = 0;
+    end
+    
+    % Record rewards for each episode
+    episode_rewards(episode) = total_reward;
+    
+    % Evaluate performance
+    final_error = abs(current_x_d - x_history(end)) * 1000;  % Convert to mm
+    
+    % Calculate steady-state error (use last 200 points for more stable estimation)
+    current_steady_error = abs(mean(current_x_d - x_history(max(1, end-min(50, step-1)):end))) * 1000;  % Convert to mm
+
+    steady_state_errors(episode) = current_steady_error;
+    
+    % Modified: Update best steady-state error and corresponding parameters
+    if current_steady_error < best_steady_state_error
+        best_steady_state_error = current_steady_error;
+        best_steady_state_params = action;
+        
+        % If reward is also best, update best parameters
+        if total_reward > best_reward
+            best_reward = total_reward;
+            best_params = action;
+        end
+    end
+
+    % Check if various thresholds are reached
+    if current_steady_error <= 0.0001 && ~target_reached
+        target_reached = true;
+        final_params = action; % Record parameters reaching 0.0001mm error
+        fprintf('\nReached 0.0001mm steady-state error threshold! (Episode %d)\n', episode);
+        fprintf('Parameters: lambda=%.2f, eta=%.2f, phi=%.4f, gamma=%.2f, width=%.2f, ki=%.2f, static_comp=%.2f\n', ...
+                final_params(1), final_params(2), final_params(3), final_params(4), ...
+                final_params(5), final_params(6), final_params(7));
+        fprintf('RBFNN friction force estimation error: %.3f N\n', rbf_approx_error);
+        fprintf('RBFNN friction force compensation ratio: %.2f%%\n', friction_approximation_ratio);
+                
+        % Modified: Set final_simulation_params to parameters meeting highest precision
+        final_simulation_params = final_params;
+        
+        % Modified: Check if should terminate early
+        if current_steady_error <= early_stop_threshold
+            early_stop_count = early_stop_count + 1;
+            if early_stop_count >= early_stop_required
+                fprintf('\nConsecutive %d times reaching early termination threshold %.6f mm, stopping training!\n',early_stop_required, early_stop_threshold);
+                early_terminated = true;
+                break;  % Early terminate training loop
+            end
+        else
+            early_stop_count = 0;  % Reset counter
+        end
+    elseif current_steady_error <= 0.0002 && ~target_reached_0_2
+        target_reached_0_2 = true;
+        final_params_0_2 = action;
+        fprintf('\nReached 0.0002mm steady-state error threshold! (Episode %d)\n', episode);
+        fprintf('Parameters: lambda=%.2f, eta=%.2f, phi=%.4f, gamma=%.2f, width=%.2f, ki=%.2f, static_comp=%.2f\n', ...
+                final_params_0_2(1), final_params_0_2(2), final_params_0_2(3), final_params_0_2(4), ...
+                final_params_0_2(5), final_params_0_2(6), final_params_0_2(7));
+        fprintf('RBFNN friction force estimation error: %.3f N\n', rbf_approx_error);
+        fprintf('RBFNN friction force compensation ratio: %.2f%%\n', friction_approximation_ratio);
+                
+        % Modified: If no higher precision parameters found yet, set to current precision parameters
+        if isempty(final_simulation_params)
+            final_simulation_params = final_params_0_2;
+        end
+    elseif current_steady_error <= 0.0005 && ~target_reached_0_5
+        target_reached_0_5 = true;
+        final_params_0_5 = action;
+        fprintf('\nReached 0.0005mm steady-state error threshold! (Episode %d)\n', episode);
+        fprintf('Parameters: lambda=%.2f, eta=%.2f, phi=%.4f, gamma=%.2f, width=%.2f, ki=%.2f, static_comp=%.2f\n', ...
+                final_params_0_5(1), final_params_0_5(2), final_params_0_5(3), final_params_0_5(4), ...
+                final_params_0_5(5), final_params_0_5(6), final_params_0_5(7));
+        fprintf('RBFNN friction force estimation error: %.3f N\n', rbf_approx_error);
+        fprintf('RBFNN friction force compensation ratio: %.2f%%\n', friction_approximation_ratio);
+                
+        % If no higher precision parameters found yet, set to current precision parameters
+        if isempty(final_simulation_params)
+            final_simulation_params = final_params_0_5;
+        end
+    end
+    
+    % Even if best parameters not found but error is small enough, can stop
+    if ~target_reached && current_steady_error <= early_stop_threshold
+        early_stop_count = early_stop_count + 1;
+        if early_stop_count >= early_stop_required
+            fprintf('\nAlthough 0.0001mm threshold not reached, but consecutive %d times below %.6f mm, stopping training!\n',  early_stop_required, early_stop_threshold);
+            final_simulation_params = action;  % Use current parameters
+            early_terminated = true;
+            break;  % Early terminate training loop
+        end
+    else
+        early_stop_count = 0;  % Reset counter
+    end
+    
+    % Display progress
+    fprintf('Episode %d: Total reward: %.4f, Final error: %.5f mm, RBFNN estimation error: %.3f N, Compensation ratio: %.2f%%\n', ...
+        episode, total_reward, final_error, rbf_approx_error, friction_approximation_ratio); 
+    
+    % Plot current performance every 20 episodes
+    if mod(episode, 5) == 0
+        % Determine parameters for testing - use parameters that meet highest precision requirements
+        %test_params = best_steady_state_params; % Default use best steady-state error parameters
+        
+        % Prioritize using parameters reaching higher precision
+        if target_reached && ~isempty(final_params)
+            test_params = final_params;
+            fprintf('Testing using 0.0001mm steady-state error threshold parameters\n');
+        elseif target_reached_0_2 && ~isempty(final_params_0_2)
+            test_params = final_params_0_2;
+            fprintf('Testing using 0.0002mm steady-state error threshold parameters\n');
+        elseif target_reached_0_5 && ~isempty(final_params_0_5)
+            test_params = final_params_0_5;
+            fprintf('Testing using 0.0005mm steady-state error threshold parameters\n');
+        else
+            test_params = best_steady_state_params;
+            fprintf('Testing using current best steady-state error parameters (%.5f mm)\n', best_steady_state_error);
+        end
+        
+        
+        % Run test using selected parameters
+        [x_test, dx_test, z_test, u_test, s_test, Ff_test] = run_simulation(x_d, dx_d, ddx_d, t, ...
+            test_params(1), test_params(2), test_params(3), ...
+            test_params(4), test_params(5), ...
+            test_params(6), test_params(7), centers, num_neurons, m, b, k, A, sigma0, ...
+            sigma1, sigma2, Fc, Fs, vs, Ts);
+        
+        figure(1);
+        subplot(2,1,1);
+        plot(t, x_d*1000, 'r--', 'LineWidth', 1.5); hold on;
+        plot(t, x_test*1000, 'b-', 'LineWidth', 1);
+        grid on;
+        legend('Target Position', 'Actual Position');
+        title(['Reinforcement Learning Training (Episode ', num2str(episode), ')']);
+        xlabel('Time (s)');
+        ylabel('Position (mm)');
+        hold off;
+        
+        subplot(2,1,2);
+        plot(t, (x_d-x_test)*1000, 'b-', 'LineWidth', 1);
+        grid on;
+        title('Position Error');
+        xlabel('Time (s)');
+        ylabel('Error (mm)');
+        ylim([-0.005, 0.005]); 
+        hold off;
+        
+        drawnow;
+    end
+ % end
+if early_terminated
+    episode_rewards = episode_rewards(1:episode);
+    param_history = param_history(1:episode,:);
+    steady_state_errors = steady_state_errors(1:episode);
+    rbf_errors = rbf_errors(1:episode);
+    friction_approximation_ratios = friction_approximation_ratios(1:episode);
+end
+
+% Plot training reward curve
+figure(2);
+plot(1:max_episodes, episode_rewards, 'LineWidth', 1);
+grid on;
+title('Reward Curve During Training');
+xlabel('Episode');
+ylabel('Cumulative Reward');
+
+% Determine whether to use parameters that meet the target as final result
+if best_steady_state_error <= steady_error_target
+    fprintf('\nFound parameters that meet target steady-state error (%.4f mm)!\n', steady_error_target);
+    fprintf('Using parameters that meet the target as final result\n');
+    best_params = best_steady_state_params;
+else
+    fprintf('\nCould not find parameters meeting target steady-state error (%.4f mm)\n', steady_error_target);
+    fprintf('Current best steady-state error: %.4f mm\n', best_steady_state_error);
+    
+    % Use current minimum steady-state error parameters
+    if best_steady_state_error < inf
+        fprintf('Using minimum steady-state error parameters as final result\n');
+        best_params = best_steady_state_params;
+    else
+        fprintf('Continuing to use best reward parameters as final result\n');
+    end
+end
+visualize_rbf_mapping(centers, final_simulation_params(5), final_simulation_params(4), num_neurons);
+
+[x, dx, z, u, s, Ff, u_rbf_history] = run_simulation(x_d, dx_d, ddx_d, t, ...
+    final_simulation_params(1), final_simulation_params(2), final_simulation_params(3),...
+    final_simulation_params(4), final_simulation_params(5), final_simulation_params(6), ...
+    final_simulation_params(7), centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+
+%% Analyze RBFNN Performance
+analyze_rbf_performance(x, dx, x_d, dx_d, t, final_simulation_params(4), final_simulation_params(5), centers, Ff, u_rbf_history);
+
+%% Compare System Performance With and Without RBFNN
+compare_with_without_rbfnn(x_d, dx_d, ddx_d, t, final_simulation_params, centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+
+%% Reinforcement Learning Training Process Visualization
+set(0, 'DefaultAxesFontName', 'Times New Roman');
+set(0, 'DefaultAxesFontSize', 10);
+set(0, 'DefaultTextFontName', 'Times New Roman');
+set(0, 'DefaultTextFontSize', 10);
+set(0, 'DefaultLineLineWidth', 1.5);
+
+% 1. Create reward curve graph
+figure('Name', 'Reinforcement Learning Training Process', 'Position', [100, 100, 800, 600]);
+
+subplot(2, 2, 1);
+plot(1:episode, episode_rewards(1:episode), 'b-');
+grid on;
+title('Reward Curve During Training');
+xlabel('Episode');
+ylabel('Cumulative Reward');
+xlim([1, episode]);
+
+% 2. Create steady-state error curve graph
+subplot(2, 2, 2);
+semilogy(1:episode, steady_state_errors(1:episode) * 1000, 'g-'); % Convert to mm
+hold on;
+yline(0.5, 'r--', '0.5');
+yline(0.2, 'r-.', '0.2');
+yline(0.1, 'r:', '0.1');
+grid on;
+title('Steady-State Error Evolution');
+xlabel('Episode');
+ylabel('Steady-State Error (mm)');
+xlim([1, episode]);
+ylim([0.05, 10]);
+legend('Steady-State Error', '0.5', '0.2', '0.1', 'Location', 'northeast');
+
+% 3. Create parameter evolution graph
+subplot(2, 2, 3);
+plot(1:episode, param_history(1:episode,:));
+grid on;
+title('Parameter Evolution');
+xlabel('Episode');
+ylabel('Parameter Value');
+xlim([1, episode]);
+legend(param_names, 'Location', 'eastoutside');
+
+% 4. Run controllers from different stages for response comparison
+% Select parameters from 3 stages (early, middle, final)
+early_episode = min(50, episode);
+mid_episode = min(round(episode/2), episode);
+final_episode = episode;
+
+[x_early, ~, ~, ~, ~, ~] = run_simulation(x_d, dx_d, ddx_d, t, ...
+    param_history(early_episode, 1), param_history(early_episode, 2), param_history(early_episode, 3), ...
+    param_history(early_episode, 4), param_history(early_episode, 5), param_history(early_episode, 6), ...
+    param_history(early_episode, 7), centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+
+[x_mid, ~, ~, ~, ~, ~] = run_simulation(x_d, dx_d, ddx_d, t, ...
+    param_history(mid_episode, 1), param_history(mid_episode, 2), param_history(mid_episode, 3), ...
+    param_history(mid_episode, 4), param_history(mid_episode, 5), param_history(mid_episode, 6), ...
+    param_history(mid_episode, 7), centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+
+[x_final, ~, ~, ~, ~, ~] = run_simulation(x_d, dx_d, ddx_d, t, ...
+    best_params(1), best_params(2), best_params(3), best_params(4), ...
+    best_params(5), best_params(6), best_params(7), ...
+    centers, num_neurons, m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs, Ts);
+
+subplot(2, 2, 4);
+plot(t, x_d*1000, 'k--', t, x_early*1000, 'r-', t, x_mid*1000, 'g-', t, x_final*1000, 'b-');
+grid on;
+title('Control Response Comparison');
+xlabel('Time (s)');
+ylabel('Position (mm)');
+xlim([0, min(3, max(t))]);
+legend('Target Position', 'Early Training', 'Mid Training', 'Final Training', 'Location', 'southeast');
+
+% Adjust subplot layout
+set(gcf, 'Color', 'white');
+sgtitle('Reinforcement Learning Optimization of RBF Neural Network Sliding Mode Control Training Process');
+
+% 5. Create position error comparison graph
+figure('Name', 'Position Error Comparison', 'Position', [100, 100, 800, 400]);
+plot(t, (x_d - x_early)*1000, 'r-', t, (x_d - x_mid)*1000, 'g-', t, (x_d - x_final)*1000, 'b-');
+grid on;
+title('Position Error Comparison');
+xlabel('Time (s)');
+ylabel('Error (mm)');
+xlim([0, min(3, max(t))]);
+ylim([-0.5, 0.5]);
+legend('Early Training Error', 'Mid Training Error', 'Final Training Error', 'Location', 'northeast');
+set(gcf, 'Color', 'white');
+
+% 6. Create phase plane trajectory graph
+figure('Name', 'Phase Plane Trajectory', 'Position', [100, 100, 800, 400]);
+
+% Calculate velocity (derivative)
+dx_early = [0, diff(x_early)]/Ts;
+dx_mid = [0, diff(x_mid)]/Ts;
+dx_final = [0, diff(x_final)]/Ts;
+
+plot((x_d - x_early)*1000, dx_d - dx_early, 'r-', ...
+     (x_d - x_mid)*1000, dx_d - dx_mid, 'g-', ...
+     (x_d - x_final)*1000, dx_d - dx_final, 'b-');
+grid on;
+title('Phase Plane Trajectory');
+xlabel('Position Error (mm)');
+ylabel('Velocity Error (m/s)');
+xlim([-0.5, 1]);
+legend('Early Training', 'Mid Training', 'Final Training', 'Location', 'northeast');
+set(gcf, 'Color', 'white');
+
+% 7. RBF Network Output Visualization
+figure('Name', 'RBF Network Visualization', 'Position', [100, 100, 1000, 500]);
+
+% Create grid
+[X, Y] = meshgrid(linspace(-0.015, 0.015, 100), linspace(-0.08, 0.08, 100));
+Z = zeros(size(X));
+
+% Calculate RBF output
+rbf_width_final = best_params(5);
+for i = 1:size(X, 1)
+    for j = 1:size(X, 2)
+        point = [X(i, j); Y(i, j)];
+        for k = 1:size(centers, 1)
+            dist = norm(point - centers(k,:)');
+            Z(i, j) = Z(i, j) + exp(-dist^2 / (2 * rbf_width_final^2));
+        end
+    end
+end
+
+subplot(1, 2, 1);
+contourf(X, Y, Z, 20);
+hold on;
+plot(centers(:, 1), centers(:, 2), 'r.', 'MarkerSize', 12);
+grid on;
+colorbar;
+title('RBF Network Output');
+xlabel('Position Error (m)');
+ylabel('Velocity Error (m/s)');
+
+subplot(1, 2, 2);
+surf(X, Y, Z);
+hold on;
+plot3(centers(:, 1), centers(:, 2), ones(size(centers, 1), 1) * max(Z(:)), 'r.', 'MarkerSize', 12);
+grid on;
+colorbar;
+title('RBF Network Output (3D)');
+xlabel('Position Error (m)');
+ylabel('Velocity Error (m/s)');
+zlabel('Network Output');
+view(45, 30);
+
+set(gcf, 'Color', 'white');
+sgtitle('RBF Neural Network Output Visualization');
+
+figure(9);
+for i = 1:action_dim
+    subplot(ceil(action_dim/2), 2, i);
+    plot(1:episode, param_history(1:episode, i), 'LineWidth', 1.5);
+    grid on;
+    title(['Parameter Change: ', param_names{i}]);
+    xlabel('Episode');
+    ylabel('Parameter Value');
+    hold on;
+    plot([1, episode], [best_params(i), best_params(i)], 'r--', 'LineWidth', 1);
+    legend('Parameter Change', 'Optimal Value');
+    hold off;
+end
