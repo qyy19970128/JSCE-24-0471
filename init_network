@@ -1,0 +1,318 @@
+function net = init_network(input_size, hidden_size, output_size)
+    net.W1 = 0.1 * randn(hidden_size, input_size);
+    net.b1 = zeros(hidden_size, 1);
+    net.W2 = 0.1 * randn(output_size, hidden_size);
+    net.b2 = zeros(output_size, 1);
+end
+
+function output = forward(net, input)
+    if size(input, 1) ~= size(net.W1, 2)
+        input = input';
+    end
+    
+    h = tanh(net.W1 * input + net.b1);
+    output = tanh(net.W2 * h + net.b2);
+end
+
+% Get action
+function action = get_action(actor, state, noise_scale, param_ranges)
+    % Ensure state does not contain NaN or Inf
+    state(isnan(state) | isinf(state)) = 0;
+    
+    normalized_action = forward(actor, state);
+    
+    % Add exploration noise
+    noise = noise_scale * randn(size(normalized_action));
+    normalized_action = normalized_action + noise;
+    normalized_action = min(max(normalized_action, -1), 1);  % Clip to [-1, 1]
+    
+    action = zeros(size(normalized_action));
+    for i = 1:length(normalized_action)
+        action(i) = param_ranges(i, 1) + (normalized_action(i) + 1) / 2 * (param_ranges(i, 2) - param_ranges(i, 1));
+    end
+end
+
+% Simulate single step function 
+function [next_x, next_dx, next_z, next_e, next_de, next_s, next_integral_error, next_rbf_out_sum, reward, u, u_rbf, Ff] = ...
+    simulate_step(x_init, dx_init, z_init, current_x_d, current_dx_d, current_ddx_d, ...
+                  lambda, eta_base, phi, rbf_gamma, rbf_width, ki, static_comp, centers, Ts, ...
+                  m, b, k, A, sigma0, sigma1, sigma2, Fc, Fs, vs)
+    
+    
+    % Calculate error and sliding surface
+    e = current_x_d - x_init;
+    de = current_dx_d - dx_init;
+    s = de + lambda * e;
+    
+    % Update integral error
+    integral_error = e * Ts;
+    integral_error = max(min(integral_error, 0.1), -0.1);  % Prevent integral saturation
+    
+    % Calculate LuGre friction force
+    if abs(dx_init) < 1e-10
+        g_v = Fc + (Fs - Fc);  % Static case
+    else
+        g_v = Fc + (Fs - Fc) * exp(-(dx_init/vs)^2);
+    end
+    
+    dz = dx_init - (sigma0 * abs(dx_init) * z_init) / max(g_v, 1e-6);
+    next_z = z_init + dz * Ts;
+    Ff = sigma0 * z_init + sigma1 * dz + sigma2 * dx_init;
+    
+    
+   % Calculate RBF network output
+    num_neurons = size(centers, 1);
+    rbf_out = zeros(num_neurons, 1);
+    state = [e; de];
+    
+    for j = 1:num_neurons
+        dist = norm(state - centers(j,:)');
+        rbf_out(j) = exp(-dist^2 / (2 * rbf_width^2));
+    end
+    
+    rbf_out_sum = sum(rbf_out);
+    u_rbf = rbf_gamma * rbf_out_sum;
+    
+    % Calculate sliding mode control input
+    if abs(s) > phi
+        u_sm = eta_base * sign(s);
+    else
+        u_sm = eta_base * s / phi;
+    end
+    
+     % Integral control
+    u_integral = ki * integral_error;
+    
+    % Static compensation - used to overcome spring force and other forces
+    static_compensation = static_comp * k * current_x_d;
+    
+    u = u_sm + u_rbf + u_integral + static_compensation;
+    
+    % Apply to system
+    P = max(0, u / A);  % Ensure pressure is non-negative
+    ddx = (P * A - b * dx_init - k * x_init - Ff) / m;
+    
+    % Use integration
+    next_dx = dx_init + ddx * Ts;
+    next_x = x_init + 0.5 * (dx_init + next_dx) * Ts; 
+    
+    next_e = current_x_d - next_x;
+    next_de = current_dx_d - next_dx;
+    next_s = next_de + lambda * next_e;
+
+    next_state = [next_e; next_de];
+    next_rbf_out = zeros(num_neurons, 1);
+    
+    for j = 1:num_neurons
+        dist = norm(next_state - centers(j,:)');
+        next_rbf_out(j) = exp(-dist^2 / (2 * rbf_width^2));
+    end
+    
+    next_rbf_out_sum = sum(next_rbf_out);
+    next_integral_error = integral_error + next_e * Ts;
+    
+    % Improved reward function
+    position_error_mm = abs(next_e) * 1000; 
+    
+ % Error-based reward function - exponential decay makes it more sensitive to small errors
+    if position_error_mm < 0.0001  % 0.0001mm
+        error_reward = 2000;  % Extremely high reward
+    elseif position_error_mm < 0.0005  % 0.0005mm
+        error_reward = 1000;  % High reward
+    elseif position_error_mm < 0.001  % 0.001mm
+        error_reward = 500;
+    elseif position_error_mm < 0.002  % 0.002mm
+        error_reward = 100;
+    else
+        error_reward = -10000 * position_error_mm^2;  % Increase penalty coefficient
+    end
+    
+   % Velocity error penalty
+    velocity_error_penalty = -2 * next_de^2;  
+    
+    % Control input smoothness reward 
+    control_smoothness = -0.00005 * u^2;
+    
+    % Stability reward 
+    stability_reward = 0;
+    if position_error_mm < abs(e) * 1000
+        stability_reward = 50;  % Reward for decreasing error
+    end
+    
+    % RBFNN friction force estimation accuracy reward 
+    rbfnn_accuracy_reward = 0;
+    if abs(u_rbf - Ff) < 20
+        rbfnn_accuracy_reward = 100;  % Extra reward if estimation error is less than 20N
+    elseif abs(u_rbf - Ff) < 50
+        rbfnn_accuracy_reward = 50;   % Moderate reward if estimation error is less than 50N
+    end
+    
+    % Comprehensive reward
+    reward = error_reward + velocity_error_penalty + control_smoothness + stability_reward + rbfnn_accuracy_reward;
+    
+    % Overshoot penalty - increase penalty
+    if next_x > current_x_d && current_x_d > 0
+        reward = reward - 2000 * (next_x - current_x_d)^2;
+    end
+    
+    % Ensure reward value is valid
+    if isnan(reward) || isinf(reward)
+        reward = -2000;
+    end
+end
+
+% Update networks
+function [replay_buffer, actor, critic, target_actor, target_critic] = update_networks_with_priority(batch, replay_buffer, actor, critic, ...
+                      target_actor, target_critic, actor_lr, critic_lr, ...
+                      gamma, tau, param_ranges, state_dim, action_dim)
+    
+    states = [batch.state];
+    actions = [batch.action];
+    rewards = [batch.reward]';
+    next_states = [batch.next_state];
+    dones = [batch.done]';
+    priorities = [batch.priority]';
+    
+    % Handle possible NaN or Inf values
+    states(isnan(states) | isinf(states)) = 0;
+    actions(isnan(actions) | isinf(actions)) = 0;
+    rewards(isnan(rewards) | isinf(rewards)) = -2000;
+    next_states(isnan(next_states) | isinf(next_states)) = 0;
+    
+    % Calculate target Q values
+   next_actions = zeros(size(actions));
+    for i = 1:size(next_states, 2)
+        next_actions(:,i) = get_action(target_actor, next_states(:,i), 0, param_ranges);
+    end
+    
+    next_q_values = zeros(size(rewards));
+    for i = 1:length(rewards)
+        next_input = [next_states(:,i); next_actions(:,i)];
+        next_q_values(i) = forward(target_critic, next_input);
+    end
+    
+    target_q = rewards + gamma * next_q_values .* (1 - dones);
+    
+    % Update Critic network
+   td_errors = zeros(size(rewards));
+    for i = 1:length(rewards)
+        state = states(:,i);
+        action = actions(:,i);
+        critic_input = [state; action];
+        
+        % Forward propagation
+        h1 = tanh(critic.W1 * critic_input + critic.b1);
+        q_pred = tanh(critic.W2 * h1 + critic.b2);
+        
+        % Calculate TD error
+        td_error = abs(q_pred - target_q(i));
+        td_errors(i) = td_error;
+        
+        % Calculate loss gradient
+        loss_grad = 2 * (q_pred - target_q(i));
+        
+        % Backpropagation
+        dW2 = loss_grad * h1';
+        db2 = loss_grad;
+        dh1 = critic.W2' * loss_grad;
+        dh1 = dh1 .* (1 - h1.^2);  % tanh derivative
+        dW1 = dh1 * critic_input';
+        db1 = dh1;
+        
+        % Update weights
+        critic.W2 = critic.W2 - critic_lr * dW2;
+        critic.b2 = critic.b2 - critic_lr * db2;
+        critic.W1 = critic.W1 - critic_lr * dW1;
+        critic.b1 = critic.b1 - critic_lr * db1;
+    end
+    
+    % Update Actor network
+    for i = 1:length(rewards)
+        state = states(:,i);
+        
+        % Get action through Actor
+        h1_actor = tanh(actor.W1 * state + actor.b1);
+        a_norm = tanh(actor.W2 * h1_actor + actor.b2);
+        
+        % Map normalized action to actual range
+        a = zeros(size(a_norm));
+        for j = 1:length(a_norm)
+            a(j) = param_ranges(j, 1) + (a_norm(j) + 1) / 2 * (param_ranges(j, 2) - param_ranges(j, 1));
+        end
+        
+        % Calculate Q value
+        critic_input = [state; a];
+        h1_critic = tanh(critic.W1 * critic_input + critic.b1);
+        q = tanh(critic.W2 * h1_critic + critic.b2);
+        
+        % Set target to maximize Q value
+        target = 1;  
+        loss_grad = 2 * (q - target);
+        
+        % Backpropagation through Critic
+        dW2_critic = loss_grad * h1_critic';
+        db2_critic = loss_grad;
+        dh1_critic = critic.W2' * loss_grad;
+        dh1_critic = dh1_critic .* (1 - h1_critic.^2);
+        dinput_critic = critic.W1' * dh1_critic;
+        
+        % Extract action gradient
+        da = dinput_critic(state_dim+1:end);
+        
+        % Backpropagation through action normalization
+        da_norm = zeros(size(da));
+        for j = 1:length(da)
+            da_norm(j) = da(j) * (param_ranges(j, 2) - param_ranges(j, 1)) / 2;
+        end
+        
+        % Backpropagation through Actor
+        dW2_actor = da_norm * h1_actor';
+        db2_actor = da_norm;
+        dh1_actor = actor.W2' * da_norm;
+        dh1_actor = dh1_actor .* (1 - h1_actor.^2);
+        dW1_actor = dh1_actor * state';
+        db1_actor = dh1_actor;
+        
+        % Update Actor weights
+        actor.W2 = actor.W2 - actor_lr * dW2_actor;
+        actor.b2 = actor.b2 - actor_lr * db2_actor;
+        actor.W1 = actor.W1 - actor_lr * dW1_actor;
+        actor.b1 = actor.b1 - actor_lr * db1_actor;
+    end
+     % Update experience priority
+    for i = 1:length(batch)
+        idx = batch(i).index;
+        if idx <= length(replay_buffer)
+            replay_buffer(idx).priority = td_errors(i) + 0.01;  % Add small constant to avoid zero priority
+        end
+    end
+    
+    % Soft update target networks
+    target_actor.W1 = (1 - tau) * target_actor.W1 + tau * actor.W1;
+    target_actor.b1 = (1 - tau) * target_actor.b1 + tau * actor.b1;
+    target_actor.W2 = (1 - tau) * target_actor.W2 + tau * actor.W2;
+    target_actor.b2 = (1 - tau) * target_actor.b2 + tau * actor.b2;
+    
+    target_critic.W1 = (1 - tau) * target_critic.W1 + tau * critic.W1;
+    target_critic.b1 = (1 - tau) * target_critic.b1 + tau * critic.b1;
+    target_critic.W2 = (1 - tau) * target_critic.W2 + tau * critic.W2;
+    target_critic.b2 = (1 - tau) * target_critic.b2 + tau * critic.b2;
+end
+function batch = sample_prioritized_batch(replay_buffer, batch_size)
+    priorities = zeros(length(replay_buffer), 1);
+    for i = 1:length(replay_buffer)
+        priorities(i) = replay_buffer(i).priority;
+    end
+    
+    % Calculate probabilities
+    probs = priorities / sum(priorities);
+    
+    % Sampling
+    indices = randsample(length(replay_buffer), min(batch_size, length(replay_buffer)), true, probs);
+    
+    % Get batch and add indices
+    batch = replay_buffer(indices);
+    for i = 1:length(batch)
+        batch(i).index = indices(i);
+    end
+end
